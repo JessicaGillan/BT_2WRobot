@@ -1,0 +1,336 @@
+/* 
+Bluetooth Module:
+TX/RX - Operate at 3V3 so USE A LVL SHIFTER!! (Arduino is at 5V)
+
+Installing the app:
+-Bluetooth settings -> connect to HC06 - PW = 1234
+-Install some sort of file manager on your device (app)
+-Plug phone in to computer via USB and download .apk file somewhere
+-Open up file manager -> find .apk file -> click install
+-Install bluetooth terminal app via store and get MAC address for BT Module
+-click Connect -> secure connect -> should list MAC addresses
+-Open Car app -> Settings -> MAC Address -> Enter: 
+-Should be set to go =)
+
+Command use: L-255\rR-120\r **For testing via Serial Monitor**
+L - the command to the left engine, R - for the right
+A dash means the motor rotation to move back
+255 - PWM value (for Arduino is the maximum speed of rotation)
+\r - end of command.
+On this command RC car will move forward and slightly 
+rotated to the right, as right engine rotates slowly left.
+L100\rR-100\r
+On this command the left engine will rotate back and forward right, 
+forcing a car to rotate around its axis counterclockwise.
+*/
+
+
+// Declare all Libraries Used
+#include<Encoder.h>     // Motor Driver
+#include <TimerOne.h>   // Timing for ultrasonic sensor
+#include <NewPing.h>    // Library for ultrasonic sensor
+#include <Wire.h>           // I2C Communication
+#include <SparkFun_APDS9960.h>   // RGB Sensor library
+
+// Declare Pins and Commands
+#define M1P1 2  //Encoder L pin 1
+#define M1P2 3  //Encoder L pin 2
+#define M2P1 5  //Encoder R pin 1
+#define M2P2 6  //Encoder R pin 2
+#define M1PWM 9 //PWM Left motor
+#define M2PWM 10  //PWM Right motor
+#define MEn 4    //PWM Enable 
+#define D1 7    //Direction of motor rotation L, LOW = forward, HIGH= back
+#define D2 8    //Direction of motor rotation R, LOW = forward, HIGH= back
+#define APDS9960_INT 19  // RGB Sensor interrupt pin 19 = interrupt number 4
+
+#define cmdL 'L' // UART-command for left motor
+#define cmdR 'R' // UART-command for right motor
+#define cmdT 'H' // UART-command to move forward til target
+
+#define TRIGGER_PIN 11  //Distance sensor signal RX pin
+#define ECHO_PIN 12     //Distance sensor signal TX pin
+
+// Constants
+#define MAX_DISTANCE 200 //Distance sensor MAX dist range in (??????)
+#define LIGHT_INT_HIGH  100 // High light level threshold for interrupt
+
+// Declare Global Variables
+char incomingByte; // incoming data
+
+char L_Data[4]; // array data for left motor
+byte L_index = 0; // index of array L
+char R_Data[4]; // array data for right motor
+byte R_index = 0; // index of array R
+char T_Data[4]; // array data for target
+byte T_index = 0; // index of array target
+char command; // command
+
+/***Change this function to ISR and add external hardware interrupt w/comparator!!*******/
+unsigned int d_min = 30; // Stopping distance for obstacle in cm
+unsigned int d_ok = 40; // Min distance away from obstacle to reset movement 
+unsigned int dcheck = 0; // Grab distance from sonar call
+int obst_flag = 0; // Flag to stop forward movement when obstacle
+
+// Add ISR Variables for RGB Target Sensor (APDS 9960)
+int isr_flag = 0;   // RGB isr flag
+
+
+// Declare Hardware components
+Encoder motorL(M1P2, M1P1);   // Declare Wheel Encoders
+Encoder motorR(M2P1, M2P2);  // Declare Wheel Encoders
+NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+SparkFun_APDS9960 apds = SparkFun_APDS9960();    // RGB Sensor
+
+// Feedback 2WD Control Stuff ************CLEAN UP**********
+int mLeftPI = 0;
+int mRightPI = 0;
+float newmotorpositionL = 0;     //variable set to read in the instaneous motor1 position in counts
+float newmotorpositionR = 0;    //variable set to read in the instaneous motor2 position in counts
+float lastmotorpositionL; //hold the left motor position for next velocity calculation 
+float lastmotorpositionR; //hold the left motor position for next velocity calculation  
+double i = 10000;              //variable set to compare current time to measure when .01 seconds have passed
+float current_time = 0;       //stores the value of time when newmotorposition is read in microseconds 
+float last_time = 0;        //stores the time that lastmotorposition was read
+float velocityR;           //calculates the velocity of the right motor
+float velocity2;          //calculates the velocity of the left motor 
+
+int mvc = 0;  //motor voltage control, control motor speed
+float errorL;//compares the desired velocity of the Left motor to the actual velocity
+float errorR;//compares the desired velocity of the Right motor to the actual velocity
+float IL =0; // This the Integrator that elimates any steady state error for the Left motor control
+float IR =0; // This the Integrator that elimates any steady state error for the Left motor control
+float uL;// PI Control Left motor
+float uR;// PI Control Right motor 
+
+
+
+void setup() {
+  // Initialize Pins 
+  pinMode(MEn, OUTPUT);    //Motor Enable
+  pinMode(M1PWM, OUTPUT); // Left motor driver pwm and en
+  pinMode(M2PWM, OUTPUT); // Right motor driver pwm and en
+
+  pinMode(D1, OUTPUT); // output for motor rotation L
+  pinMode(D2, OUTPUT); // output for motor rotation R
+  
+  // Initialize Serial communication
+  Serial.begin(115200);
+  Serial3.begin(9600);
+
+  // Initialize APDS-9960 (configure I2C and initial values)
+  if ( apds.init() ) {
+    Serial.println(F("APDS-9960 initialization complete"));
+  } else {
+    Serial.println(F("Something went wrong during APDS-9960 init!"));
+  }
+
+   // Set high interrupt thresholds  
+  if ( !apds.setLightIntHighThreshold(LIGHT_INT_HIGH) ) {
+    Serial.println(F("Error writing high threshold"));
+  }
+  
+  // Start running the APDS-9960 light sensor (no interrupts)
+  if ( apds.enableLightSensor(false) ) {
+    Serial.println(F("Light sensor is now running"));
+  } else {
+    Serial.println(F("Something went wrong during light sensor init!"));
+  }
+
+  // Read high and low interrupt thresholds
+  if ( !apds.getLightIntHighThreshold(high_threshold) ) {
+  Serial.println(F("Error reading high threshold"));
+  } else {
+      Serial.print(F("High Threshold: "));
+      Serial.println(high_threshold);
+  }
+  
+  // Enable interrupts **Aint working - Add ISR in later
+  if ( !apds.setAmbientLightIntEnable(1) ) {
+    Serial.println(F("Error enabling interrupts"));
+  }
+  // Set up interrupt for RGB Sensor (pin 21 = Interrupt 2) **This ain't working! Add ISR in later
+  attachInterrupt(4, Target_ISR, FALLING); 
+
+  
+  // Wait for initialization and calibration to finish
+  delay(500);  
+}
+
+void loop() {
+
+  // If target interrupt occurs, wait for resume command
+  if ( isr_flag == 1 ) {
+     // Set incoming byte so not resume command
+     incomingByte = 'S';
+      while( incomingByte != 'H' ){  // Wait for resume command
+          if (Serial3.available() > 0) { // if received UART data
+            incomingByte = Serial3.read(); // read byte
+            Serial.println("byte = ");
+            Serial.println(incomingByte);
+            // Balance();
+          } 
+      }
+      // Capture command T
+      command = cmdT;
+      // Reset flag and clear APDS-9960 interrupt (IMPORTANT!)
+      isr_flag = 0;
+//      if ( !apds.clearAmbientLightInt() ) {
+//        Serial.println("Error clearing interrupt");
+//      }
+  }  
+
+  // Check for obstacle before getting command, stop if obstacle
+  //Send a ping, returns the distance in centimeters or 0 (zero) if no ping echo within set distance limit 
+  dcheck = sonar.ping_cm();
+  if (dcheck <= d_min && dcheck != 0){
+    // Reverse the robot
+    Control2WD(0,0,0); 
+    Control2WD(-20,-20, 0); 
+    while( dcheck < d_ok && dcheck != 0){ 
+      dcheck = sonar.ping_cm();
+      // PI_2WD();
+      // Balance(); // Keep reversing til clear
+    }
+    Control2WD(0,0, 0); 
+  }
+  else{  
+    // Wait for serial data in order "cmdL/byteofValue//cmdR/byteofValue.../endofLine"
+    if (Serial3.available() > 0) { // if received UART data
+      incomingByte = Serial3.read(); // read byte
+      Serial.println("byte = ");
+      Serial.println(incomingByte);
+      if(incomingByte == cmdL) { // if received data for left motor L
+        command = cmdL; // current command
+        Serial.println("command = ");
+        Serial.println(command);
+        memset(L_Data,0,sizeof(L_Data)); // clear array
+        L_index = 0; // resetting array index
+      }
+      else if(incomingByte == cmdR) { // if received data for left motor R
+        command = cmdR;
+        Serial.println("command = ");
+        Serial.println(command);
+        memset(R_Data,0,sizeof(R_Data));
+        R_index = 0;
+      }
+      else if(incomingByte == cmdT) { // if received target command
+        command = cmdT;
+        Serial.println("command = ");
+        Serial.println(command);
+        memset(T_Data,0,sizeof(T_Data));
+        T_index = 0;
+      }
+      else if(incomingByte == '\r') command = 'e'; // end of line
+    
+      if(command == cmdL && incomingByte != cmdL){
+          L_Data[L_index] = incomingByte; // store each byte in the array
+          L_index++; // increment array index
+      }
+      else if(command == cmdR && incomingByte != cmdR){
+        R_Data[R_index] = incomingByte;
+        R_index++;
+      }
+      else if(command == cmdT && incomingByte != cmdT){
+        T_Data[T_index] = incomingByte;
+        T_index++;
+      }
+      else if(command == 'e'){ // if we take the line end
+        Control2WD(atoi(L_Data),atoi(R_Data),atoi(T_Data));  // Send command
+        Serial.println("Control2WD Called ");
+        delay(10);
+      }  
+    }
+  }
+
+PI_2WD();
+//  Balance(); // Correct positioning for balance control
+}
+
+// This function controls the wheels based on commands received
+void Control2WD(int mLeft, int mRight, int target){
+  Serial.println("got in control " );
+  bool directionL, directionR; // direction of motor rotation L298N
+  int valueL, valueR; // M1PWM, M2PWM (0-255)
+  Serial.println("L_data = ");
+  Serial.println(mLeft);
+  Serial.println("R_data = " );
+  Serial.println(mRight);
+  
+  if(target == 1){
+    mLeft = 50;
+    mRight = 50;
+  }
+  if(mLeft > 0){
+    valueL = mLeft;
+    directionL = HIGH;
+  }
+  else if(mLeft < 0){
+    valueL = abs(mLeft);
+    directionL = LOW;
+  }
+  else {
+    directionL = HIGH;
+    valueL = 0;
+  }
+  
+  if(mRight > 0){
+    valueR = mRight;
+    directionR = HIGH;
+  }
+  else if(mRight < 0){
+    valueR = abs(mRight);
+    directionR = LOW;
+  }
+  else {
+    directionR = HIGH;
+    valueR = 0;
+  }
+  
+  digitalWrite(MEn, HIGH);    // Enable motor output
+  analogWrite(M1PWM,valueL ); // set speed for left motor 
+  analogWrite(M2PWM,valueR ); // set speed for right motor 
+  digitalWrite(D1,directionL ); // set direction of left motor rotation 
+  digitalWrite(D2,directionR ); // set direction of right motor rotation 
+  // **Add: Set global dir/speed values for pi control to work off
+  mLeftPI = mLeft;
+  mRightPI = mRight;
+}
+
+// This function [...] balance control
+void Balance(){
+}
+
+// The target ISR uses the RGB sensor to detect a rise in ambient light
+// due to reflection of an LED off the target tape. This sensor runs on 3V3.
+// SO: Interrupt pin must be externally pulled up to 3V3 via 4.7k resistor.
+// Also double check that Arduino board I2C is at 3V3 and not 5 V
+// Use VL pin to power an LED w/resistor and point under robot so it will be reflected by tape in // to sensor 
+// (Block other light paths besides tape on GND)
+// Set HIgh interrupt threshold via testing
+/* Wiring: 
+IMPORTANT: The APDS-9960 can only accept 3.3V!
+ 
+ Arduino Pin  APDS-9960 Board  Function
+ 
+ 3.3V         VCC              Power
+ GND          GND              Ground
+ A4           SDA              I2C Data
+ A5           SCL              I2C Clock
+*/ 
+//void Target_ISR() {
+//   // Read the ambient light level
+//    if (  !apds.readAmbientLight(ambient_light) ) {
+//      Serial.println("Error reading light values");
+//    } else if( ambient_light > LIGHT_INT_HIGH){
+//      Serial.print("Ambient threshold hit: ");
+//      Serial.print(ambient_light);
+//      // Stop the robot
+//      Control2WD(0,0,0);
+//      // Set ISR flag
+//      isr_flag = 1;
+//     }
+//}
+
+
+
